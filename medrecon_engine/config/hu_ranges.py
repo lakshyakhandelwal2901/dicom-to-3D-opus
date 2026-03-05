@@ -34,7 +34,8 @@ class HUSpec(NamedTuple):
 
 HU_RANGES: dict[str, HUSpec] = {
     # ── Skeleton ──────────────────────────────────────────────────────
-    "bones":           HUSpec( 250,  3000, filename="bones",   category="bones"),
+    # 300 HU lower bound excludes intestinal contrast (200-300 HU)
+    "bones":           HUSpec( 300,  3000, filename="bones",   category="bones"),
 
     # ── Lungs ─────────────────────────────────────────────────────────
     "lungs":           HUSpec(-950,  -650, filename="lungs",   category="lungs"),

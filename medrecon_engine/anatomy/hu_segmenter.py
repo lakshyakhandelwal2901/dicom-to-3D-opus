@@ -113,11 +113,14 @@ def segment_all(ct_image: sitk.Image) -> dict[str, sitk.Image]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _segment_bones(ct_image: sitk.Image) -> sitk.Image:
-    """Bones: threshold > 250 HU, keep top 20 connected components.
+    """Bones: threshold > 300 HU, keep top 15 CC, morphological closing.
 
-    Captures both trabecular (250–900) and cortical (900–3000) bone
-    in a single pass.  The top-20 CC filter keeps major skeletal
-    structures (spine, ribs, pelvis, femurs, etc.) and removes noise.
+    300 HU lower bound cleanly separates bone from intestinal contrast
+    (200–300 HU).  Captures trabecular (300–900) and cortical (>900).
+    Pipeline:
+      1. HU threshold [300, 3000]
+      2. Keep top-15 connected components (spine, pelvis, ribs, femurs…)
+      3. Binary closing [2,2,2] — fills internal trabecular pores
     """
     spec = HU_RANGES["bones"]
     mask = sitk.BinaryThreshold(
@@ -128,8 +131,11 @@ def _segment_bones(ct_image: sitk.Image) -> sitk.Image:
     )
     mask = sitk.Cast(mask, sitk.sitkUInt8)
 
-    # Keep top 20 largest connected components
-    mask = _keep_top_n_components(mask, n=20)
+    # Keep top 15 largest connected components
+    mask = _keep_top_n_components(mask, n=15)
+
+    # Fill internal trabecular pores and small gaps
+    mask = sitk.BinaryMorphologicalClosing(mask, [2, 2, 2], sitk.sitkBall, 1)
 
     return mask
 

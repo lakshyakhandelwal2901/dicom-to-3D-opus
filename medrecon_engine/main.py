@@ -472,7 +472,7 @@ def run_hu_pipeline(
 
         mesh = generate_tissue_mesh(
             ct_crop, mask_crop,
-            smooth_iterations=20,
+            smooth_iterations=25,
             smooth_passband=0.08,
         )
         if mesh is None:
