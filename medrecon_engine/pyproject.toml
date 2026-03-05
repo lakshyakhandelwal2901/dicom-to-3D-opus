@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "medrecon-engine"
+version = "1.0.0"
+description = "Universal CT → Surgical 3D STL Engine — deterministic, audit-ready, on-prem."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Proprietary — Medical Use Only"}
+authors = [
+    {name = "MedRecon Team"},
+]
+
+dependencies = [
+    "pydicom>=2.4",
+    "SimpleITK>=2.3",
+    "vtk>=9.2",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "scikit-image>=0.21",
+    "pydantic>=2.0",
+    "click>=8.1",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.1",
+    "mypy>=1.5",
+]
+
+[project.scripts]
+medrecon = "medrecon_engine.main:cli"
+
+[tool.setuptools.packages.find]
+include = ["medrecon_engine*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+markers = [
+    "slow: marks tests that require real DICOM data",
+    "integration: end-to-end pipeline tests",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
