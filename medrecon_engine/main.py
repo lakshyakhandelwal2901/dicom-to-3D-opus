@@ -377,6 +377,215 @@ def _print_summary(records: List[AuditRecord]) -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+# Pure-HU pipeline  (DICOM → HU segmentation → mesh → OBJ)
+# ═══════════════════════════════════════════════════════════════════════════
+def run_hu_pipeline(
+    dicom_path: str | Path,
+    output_dir: str | Path,
+    *,
+    config: Optional[PrecisionConfig] = None,
+) -> None:
+    """Pure HU-based pipeline: DICOM → denoise → organ segmentation → mesh → OBJ.
+
+    Architecture::
+
+        1. Load DICOM volume
+        2. Anisotropic diffusion smoothing  (denoise, preserve edges)
+        3. Organ-specific HU segmentation   (bones, lungs, liver, kidneys)
+        4. Gradient-guided mesh extraction   (FlyingEdges + auto-downsampling)
+        5. Taubin smoothing + export OBJ
+
+    Parameters
+    ----------
+    dicom_path : str | Path
+        Path to a directory containing DICOM files.
+    output_dir : str | Path
+        Root output directory.
+    config : PrecisionConfig | None
+        Override default precision configuration.
+    """
+    from medrecon_engine.anatomy.hu_segmenter import segment_all
+    from medrecon_engine.mesh.vtk_generator import generate_tissue_mesh
+    from medrecon_engine.mesh.mesh_from_labels import _organ_bbox
+    from medrecon_engine.export.obj_writer import save_obj
+    from medrecon_engine.config.hu_ranges import HU_RANGES
+
+    cfg = config or PrecisionConfig()
+    dicom_path = Path(dicom_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    t_start = time.perf_counter()
+    _log.info("═" * 60)
+    _log.info("MedRecon Engine — Pure HU Pipeline")
+    _log.info("  DICOM → denoise → organ segmentation → mesh → OBJ")
+    _log.info("DICOM source : %s", dicom_path)
+    _log.info("Output dir   : %s", output_dir)
+    _log.info("═" * 60)
+
+    # ── Step 1: Load DICOM volume ─────────────────────────────────────
+    _log.info("[1/5] Loading DICOM volume …")
+    loader = VolumeLoader()
+    ct_image = loader.load(directory=dicom_path)
+    _log.info("  Volume: %s  Spacing: %s", ct_image.GetSize(), ct_image.GetSpacing())
+
+    # ── Step 2: Anisotropic diffusion smoothing ───────────────────────
+    _log.info("[2/5] Applying anisotropic diffusion smoothing …")
+    t_diff = time.perf_counter()
+    ct_float = sitk.Cast(ct_image, sitk.sitkFloat32)
+    # timeStep must be < 0.5 / (2^dim) for stability;
+    # for anisotropic spacing the limit is tighter — ITK reports
+    # the actual limit at runtime.  0.04 is safe for all CT spacings.
+    ct_smooth = sitk.CurvatureAnisotropicDiffusion(
+        ct_float,
+        timeStep=0.04,
+        conductanceParameter=3.0,
+        conductanceScalingUpdateInterval=1,
+        numberOfIterations=5,
+    )
+    _log.info("  Diffusion smoothing done in %.1f s", time.perf_counter() - t_diff)
+
+    # ── Step 3: Organ-specific HU segmentation ────────────────────────
+    _log.info("[3/5] Running organ-specific HU segmentation …")
+    tissue_masks = segment_all(ct_smooth)
+    _log.info("  %d masks produced", len(tissue_masks))
+
+    # ── Step 4: High-quality surface extraction ───────────────────────
+    _log.info("[4/5] Extracting surfaces (FlyingEdges + Taubin smooth) …")
+    import vtk
+    vtk_meshes: dict[str, vtk.vtkPolyData] = {}
+
+    for structure, mask in tissue_masks.items():
+        _log.info("  Meshing: %s", structure)
+        t0 = time.perf_counter()
+
+        arr = sitk.GetArrayFromImage(mask)
+        nz = int(np.count_nonzero(arr))
+        if nz == 0:
+            continue
+
+        # Crop to bounding box for memory efficiency
+        start_idx, crop_size = _organ_bbox(arr)
+        ct_crop = sitk.RegionOfInterest(ct_smooth, crop_size, start_idx)
+        mask_crop = sitk.RegionOfInterest(mask, crop_size, start_idx)
+
+        mesh = generate_tissue_mesh(
+            ct_crop, mask_crop,
+            smooth_iterations=20,
+            smooth_passband=0.08,
+        )
+        if mesh is None:
+            _log.info("    %s: empty mesh, skipping", structure)
+            continue
+
+        _log.info(
+            "    %s: %d pts, %d faces  %.1f s",
+            structure,
+            mesh.GetNumberOfPoints(),
+            mesh.GetNumberOfCells(),
+            time.perf_counter() - t0,
+        )
+        vtk_meshes[structure] = mesh
+
+    # ── Step 5: Export OBJ ────────────────────────────────────────────
+    _log.info("[5/5] Exporting %d OBJ meshes …", len(vtk_meshes))
+
+    results: dict[str, Path] = {}
+    for name, mesh in sorted(vtk_meshes.items()):
+        spec = HU_RANGES.get(name)
+        category = spec.category if spec else "others"
+        filename = spec.filename if spec else name
+        cat_dir = output_dir / category
+        cat_dir.mkdir(parents=True, exist_ok=True)
+        obj_path = save_obj(mesh, cat_dir / f"{filename}.obj")
+        results[name] = obj_path
+
+    elapsed = time.perf_counter() - t_start
+    _log.info("═" * 60)
+    _log.info("PURE-HU PIPELINE DONE — %d meshes in %.1f s", len(results), elapsed)
+    for name, path in sorted(results.items()):
+        _log.info("  %s → %s", name, path)
+    _log.info("═" * 60)
+
+    console.print(f"\n[bold green]Pure-HU pipeline complete:[/bold green] {len(results)} meshes in {elapsed:.1f} s")
+    console.print(f"  Output : {output_dir}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AI segmentation pipeline (TotalSegmentator)
+# ═══════════════════════════════════════════════════════════════════════════
+def run_ai_pipeline(
+    dicom_path: str | Path,
+    output_dir: str | Path,
+    *,
+    fast: bool = False,
+    config: Optional[PrecisionConfig] = None,
+) -> None:
+    """Run the AI-powered pipeline: DICOM → NIfTI → TotalSegmentator → OBJ.
+
+    This replaces the classic threshold-based segmentation with
+    TotalSegmentator's deep-learning model, producing one OBJ mesh
+    per anatomical structure (up to 117 structures).
+
+    Parameters
+    ----------
+    dicom_path : str | Path
+        Path to a directory containing DICOM files.
+    output_dir : str | Path
+        Root output directory for NIfTI, labels, and OBJ meshes.
+    fast : bool
+        Use TotalSegmentator's fast (lower-res) model variant.
+    config : PrecisionConfig | None
+        Override default precision configuration.
+    """
+    from medrecon_engine.core.dicom_to_nifti import dicom_to_nifti
+    from medrecon_engine.anatomy.ai_segmenter import AISegmenter
+    from medrecon_engine.mesh.mesh_from_labels import generate_meshes_from_labels
+    from medrecon_engine.mesh.mesh_organizer import organize_and_merge
+
+    cfg = config or PrecisionConfig()
+    dicom_path = Path(dicom_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    t_start = time.perf_counter()
+    _log.info("═" * 60)
+    _log.info("MedRecon Engine — AI Segmentation (TotalSegmentator)")
+    _log.info("DICOM source : %s", dicom_path)
+    _log.info("Output dir   : %s", output_dir)
+    _log.info("═" * 60)
+
+    # Step 1: DICOM → NIfTI
+    _log.info("[1/4] Converting DICOM → NIfTI …")
+    nifti_path = dicom_to_nifti(dicom_path, output_dir / "scan.nii.gz")
+
+    # Step 2: TotalSegmentator
+    _log.info("[2/4] Running TotalSegmentator …")
+    ai = AISegmenter(output_dir, fast=fast)
+    label_dir = ai.segment(nifti_path)
+
+    # Step 3: Labels → Meshes (Gradient-guided + improve_mesh)
+    _log.info("[3/4] Loading CT volume & generating gradient-guided meshes …")
+    import SimpleITK as sitk
+    ct_image = sitk.ReadImage(str(nifti_path))
+    vtk_meshes = generate_meshes_from_labels(label_dir, ct_image=ct_image)
+
+    # Step 4: Organize, merge, and export
+    _log.info("[4/4] Organizing & merging anatomical groups …")
+    results = organize_and_merge(vtk_meshes, output_dir)
+
+    elapsed = time.perf_counter() - t_start
+    _log.info("═" * 60)
+    _log.info("AI PIPELINE DONE — %d final meshes in %.1f s", len(results), elapsed)
+    for name, path in sorted(results.items()):
+        _log.info("  %s → %s", name, path)
+    _log.info("═" * 60)
+
+    console.print(f"\n[bold green]AI pipeline complete:[/bold green] {len(results)} organised meshes in {elapsed:.1f} s")
+    console.print(f"  Output: {output_dir}")
+
+
 @click.command("medrecon")
 @click.option(
     "--dicom", "-d",
@@ -402,6 +611,19 @@ def _print_summary(records: List[AuditRecord]) -> None:
     help="Output root directory for STL + audit files.",
 )
 @click.option(
+    "--segmentation", "-s",
+    type=click.Choice(["classic", "ai", "hu"], case_sensitive=False),
+    default="hu",
+    show_default=True,
+    help="Segmentation mode: 'hu' (pure HU threshold — recommended), 'classic' (per-anatomy threshold), or 'ai' (TotalSegmentator).",
+)
+@click.option(
+    "--fast-ai",
+    is_flag=True,
+    default=False,
+    help="Use TotalSegmentator fast model (lower resolution, faster).",
+)
+@click.option(
     "--precision-mm",
     type=float,
     default=None,
@@ -424,6 +646,8 @@ def cli(
     batch_dir: Optional[str],
     anatomy: tuple,
     output: str,
+    segmentation: str,
+    fast_ai: bool,
     precision_mm: Optional[float],
     no_smooth: bool,
     ascii_stl: bool,
@@ -442,15 +666,6 @@ def cli(
         console.print("[red]Error:[/red] Provide --dicom or --batch-dir.")
         sys.exit(1)
 
-    # ── Resolve anatomy list ─────────────────────────────────────────
-    if "all" in anatomy:
-        anatomies = list_anatomies()
-    else:
-        anatomies = list(anatomy)
-
-    console.print(f"  Anatomies : {', '.join(anatomies)}")
-    console.print(f"  Output    : {output}")
-
     # ── Build config overrides ────────────────────────────────────────
     overrides = {}
     if precision_mm is not None:
@@ -462,7 +677,40 @@ def cli(
 
     cfg = PrecisionConfig(**overrides) if overrides else PrecisionConfig()
 
-    # ── Run ───────────────────────────────────────────────────────────
+    # ── AI segmentation branch ────────────────────────────────────────
+    if segmentation == "ai":
+        if not dicom:
+            console.print("[red]Error:[/red] AI mode requires --dicom (no batch support yet).")
+            sys.exit(1)
+        console.print(f"  Mode      : [bold magenta]AI (TotalSegmentator)[/bold magenta]")
+        console.print(f"  Fast      : {fast_ai}")
+        console.print(f"  Output    : {output}")
+        run_ai_pipeline(dicom, output, fast=fast_ai, config=cfg)
+        return
+
+    # ── Pure HU segmentation branch ────────────────────────────────────
+    if segmentation == "hu":
+        if not dicom:
+            console.print("[red]Error:[/red] HU mode requires --dicom (no batch support yet).")
+            sys.exit(1)
+        console.print(f"  Mode      : [bold green]Pure HU (threshold → morphology → gradient mesh)[/bold green]")
+        console.print(f"  Output    : {output}")
+        run_hu_pipeline(dicom, output, config=cfg)
+        return
+
+    # ── Classic segmentation branch ───────────────────────────────────
+    console.print(f"  Mode      : [bold cyan]Classic (threshold)[/bold cyan]")
+
+    # Resolve anatomy list
+    if "all" in anatomy:
+        anatomies = list_anatomies()
+    else:
+        anatomies = list(anatomy)
+
+    console.print(f"  Anatomies : {', '.join(anatomies)}")
+    console.print(f"  Output    : {output}")
+
+    # Run
     if batch_dir:
         records = run_batch_dir(batch_dir, anatomies, output, config=cfg)
     else:
@@ -470,7 +718,7 @@ def cli(
 
     _print_summary(records)
 
-    # ── Exit code: non-zero if any case failed ────────────────────────
+    # Exit code: non-zero if any case failed
     failures = sum(1 for r in records if not r.success)
     if failures:
         console.print(f"[red]{failures} case(s) failed.[/red]")
