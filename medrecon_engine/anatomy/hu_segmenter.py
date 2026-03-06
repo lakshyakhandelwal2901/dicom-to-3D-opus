@@ -8,9 +8,9 @@ Pipeline per organ:
 1. **Bones** — HU > 300 → opening → top-20 CC → closing → mesh
 2. **Lungs** — HU -950 to -650, body-mask to exclude exterior air,
    top-2 CC, closing
-3. **Liver** — HU 40–70, seeded region growing from right-abdomen,
-   fallback to ROI-restricted wider threshold
-4. **Kidneys** — HU 20–45, z-band restriction (T12–L3), top-2 CC
+3. **Liver** — HU 40–70 primary / 30–80 fallback, ROI-restricted
+   thresholding (right abdomen), 4-tier strategy adaptive to patient
+4. **Kidneys** — HU 20–45, z-band 30–70 %, size-filtered CC (50K–800K)
 
 Hierarchical subtraction: bones > lungs > liver > kidneys.
 
@@ -149,33 +149,53 @@ def _segment_lungs(ct: sitk.Image) -> sitk.Image:
 
 
 def _segment_liver(ct: sitk.Image) -> sitk.Image:
-    """Liver: seeded region growing [40-70 HU] from right-abdomen seed.
+    """Liver: 4-tier ROI-restricted HU thresholding — no region growing.
 
-    Falls back to a wider ROI-restricted threshold [30-80 HU] if
-    region growing produces an unreasonable volume.
+    Region growing on soft tissue always leaks (entire abdomen is
+    connected at liver-range HU values). Instead we use spatial ROI
+    restriction + morphological refinement.
+
+    4-tier strategy (prefer opening for controlled size, widen before
+    removing opening):
+    1. [40, 70] + opening  → L067 wins here (opening prevents oversizing)
+    2. [30, 80] + opening  → L143 wins here (wider range, size controlled)
+    3. [40, 70] no opening → L096 wins here (opening fragments its liver)
+    4. [30, 80] no opening → last resort
+
+    Each tier in right-55% abdomen, z 20–75%.
+    Accept threshold: ≥ 400K voxels.
     """
     spec = HU_RANGES["liver"]
 
-    seed = _find_liver_seed(ct, spec.hu_low, spec.hu_high)
+    # ── Tier 1: [40, 70] + opening ───────────────────────────────────
+    mask = _liver_roi_threshold(ct, spec.hu_low, spec.hu_high, use_opening=True)
+    count = int(np.count_nonzero(sitk.GetArrayViewFromImage(mask)))
+    _log.info("    liver: tier-1 [%.0f, %.0f]+opening → %d voxels",
+              spec.hu_low, spec.hu_high, count)
 
-    if seed is not None:
-        grown = sitk.ConnectedThreshold(
-            ct, seedList=[seed],
-            lower=spec.hu_low, upper=spec.hu_high,
-            replaceValue=1,
-        )
-        grown = sitk.Cast(grown, sitk.sitkUInt8)
-        count = int(np.count_nonzero(sitk.GetArrayViewFromImage(grown)))
-        _log.info("    liver: region growing from %s -> %d voxels", seed, count)
+    if count < 400_000:
+        # ── Tier 2: [30, 80] + opening ──────────────────────────────
+        mask2 = _liver_roi_threshold(ct, 30, 80, use_opening=True)
+        count2 = int(np.count_nonzero(sitk.GetArrayViewFromImage(mask2)))
+        _log.info("    liver: tier-2 [30, 80]+opening → %d voxels", count2)
 
-        if 50_000 < count < 5_000_000:
-            mask = grown
+        if count2 >= 400_000:
+            mask, count = mask2, count2
         else:
-            _log.info("    liver: region growing out of range, using ROI fallback")
-            mask = _liver_roi_fallback(ct)
-    else:
-        _log.info("    liver: no seed found, using ROI fallback")
-        mask = _liver_roi_fallback(ct)
+            # ── Tier 3: [40, 70] no opening ─────────────────────────
+            mask3 = _liver_roi_threshold(ct, spec.hu_low, spec.hu_high, use_opening=False)
+            count3 = int(np.count_nonzero(sitk.GetArrayViewFromImage(mask3)))
+            _log.info("    liver: tier-3 [%.0f, %.0f] no-opening → %d voxels",
+                      spec.hu_low, spec.hu_high, count3)
+
+            if count3 >= 400_000:
+                mask, count = mask3, count3
+            else:
+                # ── Tier 4: [30, 80] no opening ─────────────────────
+                mask4 = _liver_roi_threshold(ct, 30, 80, use_opening=False)
+                count4 = int(np.count_nonzero(sitk.GetArrayViewFromImage(mask4)))
+                _log.info("    liver: tier-4 [30, 80] no-opening → %d voxels", count4)
+                mask, count = mask4, count4
 
     # Close internal vessel gaps
     mask = sitk.BinaryMorphologicalClosing(mask, [3, 3, 3], sitk.sitkBall, 1)
@@ -184,33 +204,49 @@ def _segment_liver(ct: sitk.Image) -> sitk.Image:
     return mask
 
 
-def _liver_roi_fallback(ct: sitk.Image) -> sitk.Image:
-    """Fallback: wider HU [30,80] restricted to right-abdomen ROI."""
-    mask = sitk.BinaryThreshold(ct, lowerThreshold=30, upperThreshold=80,
+def _liver_roi_threshold(
+    ct: sitk.Image, hu_low: float, hu_high: float, use_opening: bool = True,
+) -> sitk.Image:
+    """Threshold + restrict to right abdomen ROI + optional opening + largest CC.
+
+    ROI: z 20-75%, right 55% (x >= 45% of width).
+    No anterior/posterior restriction — liver wraps around.
+    """
+    mask = sitk.BinaryThreshold(ct, lowerThreshold=hu_low, upperThreshold=hu_high,
                                 insideValue=1, outsideValue=0)
     mask = sitk.Cast(mask, sitk.sitkUInt8)
 
     arr = sitk.GetArrayFromImage(mask)  # (z, y, x)
     zs, ys, xs = arr.shape
-    arr[:int(zs * 0.25), :, :] = 0       # above liver
+    arr[:int(zs * 0.20), :, :] = 0       # above liver
     arr[int(zs * 0.75):, :, :] = 0       # below liver
-    arr[:, :, :xs // 2] = 0              # left side
+    arr[:, :, :int(xs * 0.45)] = 0        # left side (keep right 55%)
 
     mask = sitk.GetImageFromArray(arr)
     mask.CopyInformation(ct)
     mask = sitk.Cast(mask, sitk.sitkUInt8)
 
-    # Light opening to break thin bridges
-    mask = sitk.BinaryMorphologicalOpening(mask, [1, 1, 1], sitk.sitkBall, 0, 1)
+    if use_opening:
+        # Gentle opening to break thin bridges without fragmenting liver
+        mask = sitk.BinaryMorphologicalOpening(mask, [1, 1, 1], sitk.sitkBall, 0, 1)
+
+    # Keep only the largest blob (should be liver)
     mask = _keep_top_n(mask, 1)
+
     return mask
 
 
 def _segment_kidneys(ct: sitk.Image) -> sitk.Image:
-    """Kidneys: HU 20-45, z-band 30-70%, top-2 CC, closing.
+    """Kidneys: HU 20-45, z-band 30-70 %, size-filtered CC.
 
-    Z-band restriction isolates the T12-L3 vertebrae region
-    where kidneys reside.
+    Strategy:
+    1. Threshold [20, 45] HU, restrict to z-band 30-70%
+    2. Gentle opening [1,1,1] to break thin fascial bridges
+    3. Size-filtered CC: keep components 50K-800K voxels (20-320 mL),
+       max 2 (left + right kidney)
+    4. If nothing qualifies, try without opening
+    5. If still nothing, return empty mask (better than returning
+       massive muscle blobs that scored poorly in analysis)
     """
     spec = HU_RANGES["kidneys"]
 
@@ -220,22 +256,37 @@ def _segment_kidneys(ct: sitk.Image) -> sitk.Image:
                                 insideValue=1, outsideValue=0)
     mask = sitk.Cast(mask, sitk.sitkUInt8)
 
-    # Z-band restriction: kidneys at 30-70% of axial range
+    # z-band: kidneys at 30-70% of axial range
     arr = sitk.GetArrayFromImage(mask)  # (z, y, x)
     zs = arr.shape[0]
     arr[:int(zs * 0.30), :, :] = 0
     arr[int(zs * 0.70):, :, :] = 0
 
-    mask = sitk.GetImageFromArray(arr)
-    mask.CopyInformation(ct)
-    mask = sitk.Cast(mask, sitk.sitkUInt8)
+    mask_zbanded = sitk.GetImageFromArray(arr)
+    mask_zbanded.CopyInformation(ct)
+    mask_zbanded = sitk.Cast(mask_zbanded, sitk.sitkUInt8)
 
-    # Left + right kidney
-    mask = _keep_top_n(mask, 2)
+    # Try with gentle opening first
+    opened = sitk.BinaryMorphologicalOpening(
+        mask_zbanded, [1, 1, 1], sitk.sitkBall, 0, 1)
+    result = _keep_by_size(opened, min_voxels=50_000, max_voxels=800_000, max_count=2)
+    count = int(np.count_nonzero(sitk.GetArrayViewFromImage(result)))
+
+    if count == 0:
+        # Retry without opening — keeps larger connected regions
+        _log.info("    kidneys: opening + size-filter gave 0, retrying without opening")
+        result = _keep_by_size(
+            mask_zbanded, min_voxels=50_000, max_voxels=800_000, max_count=2)
+        count = int(np.count_nonzero(sitk.GetArrayViewFromImage(result)))
+
+    if count == 0:
+        _log.info("    kidneys: no kidney-sized components found, returning empty")
+        empty = sitk.Image(ct.GetSize(), sitk.sitkUInt8)
+        empty.CopyInformation(ct)
+        return empty
 
     # Fill internal gaps
-    mask = sitk.BinaryMorphologicalClosing(mask, [3, 3, 3], sitk.sitkBall, 1)
-
+    mask = sitk.BinaryMorphologicalClosing(result, [2, 2, 2], sitk.sitkBall, 1)
     return mask
 
 
@@ -253,57 +304,51 @@ def _keep_top_n(mask: sitk.Image, n: int) -> sitk.Image:
     )
 
 
-def _find_liver_seed(
-    ct: sitk.Image, hu_low: float, hu_high: float,
-) -> tuple[int, int, int] | None:
-    """Find a seed voxel in the right-abdomen for liver region growing.
+def _keep_by_size(
+    mask: sitk.Image,
+    min_voxels: int,
+    max_voxels: int,
+    max_count: int = 2,
+) -> sitk.Image:
+    """Keep connected components whose size is within [min, max] voxels.
 
-    Searches the right half of the volume, middle 50% of z,
-    and returns a voxel near the centroid of qualifying voxels
-    whose HU is within [hu_low, hu_high].
-
-    Returns (x, y, z) in SimpleITK index order, or None.
+    Returns up to *max_count* qualifying components, largest first.
+    This is critical for kidneys where top-N CC picks muscle blobs
+    instead of the smaller kidney-shaped components.
     """
-    arr = sitk.GetArrayViewFromImage(ct)  # (z, y, x)
-    zs, ys, xs = arr.shape
+    cc = sitk.ConnectedComponent(mask)
+    relabeled = sitk.RelabelComponent(cc, sortByObjectSize=True)
+    arr = sitk.GetArrayFromImage(relabeled)
 
-    z0, z1 = int(zs * 0.25), int(zs * 0.75)
-    x_mid = xs // 2
+    labels = np.unique(arr)
+    labels = labels[labels > 0]  # skip background
 
-    roi = arr[z0:z1, :, x_mid:]
-    qualifying = (roi >= hu_low) & (roi <= hu_high)
-    nz = np.nonzero(qualifying)
+    kept = 0
+    result = np.zeros_like(arr, dtype=np.uint8)
 
-    if len(nz[0]) < 100:
-        _log.info("    liver: only %d qualifying voxels in ROI", len(nz[0]))
-        return None
+    for label in labels:
+        count = int(np.count_nonzero(arr == label))
+        if count < min_voxels:
+            # Labels are sorted by size — all remaining are smaller
+            break
+        if count <= max_voxels:
+            result[arr == label] = 1
+            kept += 1
+            _log.info("    size-filter: label %d = %d voxels — kept", label, count)
+            if kept >= max_count:
+                break
+        else:
+            _log.info("    size-filter: label %d = %d voxels — too large, skipped",
+                      label, count)
 
-    # Centroid of qualifying region
-    cz = int(np.mean(nz[0])) + z0
-    cy = int(np.mean(nz[1]))
-    cx = int(np.mean(nz[2])) + x_mid
+    if kept == 0:
+        _log.info("    size-filter: no components in [%d, %d] range",
+                  min_voxels, max_voxels)
+        # Return empty mask — let caller decide what to do
+        out = sitk.GetImageFromArray(result)
+        out.CopyInformation(mask)
+        return sitk.Cast(out, sitk.sitkUInt8)
 
-    # Verify seed is in range
-    if hu_low <= float(arr[cz, cy, cx]) <= hu_high:
-        _log.info("    liver: seed at (%d,%d,%d) val=%.1f HU",
-                  cx, cy, cz, float(arr[cz, cy, cx]))
-        return (int(cx), int(cy), int(cz))
-
-    # Search nearby 10-voxel radius for a valid seed
-    _log.info("    liver: centroid val=%.1f HU out of range, searching nearby",
-              float(arr[cz, cy, cx]))
-    best_d, best = float("inf"), None
-    for dz in range(-10, 11):
-        for dy in range(-10, 11):
-            for dx in range(-10, 11):
-                sz, sy, sx = cz + dz, cy + dy, cx + dx
-                if 0 <= sz < zs and 0 <= sy < ys and 0 <= sx < xs:
-                    v = float(arr[sz, sy, sx])
-                    if hu_low <= v <= hu_high:
-                        d = dz * dz + dy * dy + dx * dx
-                        if d < best_d:
-                            best_d, best = d, (int(sx), int(sy), int(sz))
-
-    if best:
-        _log.info("    liver: nearby seed at %s", best)
-    return best
+    out = sitk.GetImageFromArray(result)
+    out.CopyInformation(mask)
+    return sitk.Cast(out, sitk.sitkUInt8)

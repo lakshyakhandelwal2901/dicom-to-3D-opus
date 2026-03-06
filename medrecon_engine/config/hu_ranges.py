@@ -41,7 +41,11 @@ HU_RANGES: dict[str, HUSpec] = {
     "lungs":           HUSpec(-950,  -650, filename="lungs",   category="lungs"),
 
     # ── Soft-tissue organs ────────────────────────────────────────────
+    # Liver: primary ROI threshold [40,70] covers most patients;
+    # auto-widens to [30,80] when primary yields too few voxels
     "liver":           HUSpec(  40,    70, filename="liver",   category="organs"),
+    # Kidneys: 20-45 HU captures renal parenchyma; size-filtered CC
+    # rejects the large muscle blobs that also fall in this range
     "kidneys":         HUSpec(  20,    45, filename="kidneys", category="organs"),
 }
 
