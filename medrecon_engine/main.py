@@ -386,7 +386,7 @@ def run_hu_pipeline(
     *,
     config: Optional[PrecisionConfig] = None,
 ) -> None:
-    """Pure HU-based pipeline: DICOM → denoise → organ segmentation → mesh → OBJ.
+    """Pure HU-based pipeline: DICOM → denoise → organ segmentation → mesh → OBJ → visualization.
 
     Architecture::
 
@@ -394,7 +394,8 @@ def run_hu_pipeline(
         2. Anisotropic diffusion smoothing  (denoise, preserve edges)
         3. Organ-specific HU segmentation   (bones, lungs, liver, kidneys)
         4. Gradient-guided mesh extraction   (FlyingEdges + auto-downsampling)
-        5. Taubin smoothing + export OBJ
+        5. Export OBJ meshes
+        6. Generate visualization report    (3D views, slice overlays, HTML report)
 
     Parameters
     ----------
@@ -425,13 +426,13 @@ def run_hu_pipeline(
     _log.info("═" * 60)
 
     # ── Step 1: Load DICOM volume ─────────────────────────────────────
-    _log.info("[1/5] Loading DICOM volume …")
+    _log.info("[1/6] Loading DICOM volume …")
     loader = VolumeLoader()
     ct_image = loader.load(directory=dicom_path)
     _log.info("  Volume: %s  Spacing: %s", ct_image.GetSize(), ct_image.GetSpacing())
 
     # ── Step 2: Anisotropic diffusion smoothing ───────────────────────
-    _log.info("[2/5] Applying anisotropic diffusion smoothing …")
+    _log.info("[2/6] Applying anisotropic diffusion smoothing …")
     t_diff = time.perf_counter()
     ct_float = sitk.Cast(ct_image, sitk.sitkFloat32)
     # timeStep must be < 0.5 / (2^dim) for stability;
@@ -447,12 +448,12 @@ def run_hu_pipeline(
     _log.info("  Diffusion smoothing done in %.1f s", time.perf_counter() - t_diff)
 
     # ── Step 3: Organ-specific HU segmentation ────────────────────────
-    _log.info("[3/5] Running organ-specific HU segmentation …")
+    _log.info("[3/6] Running organ-specific HU segmentation …")
     tissue_masks = segment_all(ct_smooth)
     _log.info("  %d masks produced", len(tissue_masks))
 
     # ── Step 4: High-quality surface extraction ───────────────────────
-    _log.info("[4/5] Extracting surfaces (FlyingEdges + Taubin smooth) …")
+    _log.info("[4/6] Extracting surfaces (FlyingEdges + Taubin smooth) …")
     import vtk
     vtk_meshes: dict[str, vtk.vtkPolyData] = {}
 
@@ -489,7 +490,7 @@ def run_hu_pipeline(
         vtk_meshes[structure] = mesh
 
     # ── Step 5: Export OBJ ────────────────────────────────────────────
-    _log.info("[5/5] Exporting %d OBJ meshes …", len(vtk_meshes))
+    _log.info("[5/6] Exporting %d OBJ meshes …", len(vtk_meshes))
 
     results: dict[str, Path] = {}
     for name, mesh in sorted(vtk_meshes.items()):
@@ -500,6 +501,21 @@ def run_hu_pipeline(
         cat_dir.mkdir(parents=True, exist_ok=True)
         obj_path = save_obj(mesh, cat_dir / f"{filename}.obj")
         results[name] = obj_path
+
+    # ── Step 6: Visualization & Report ────────────────────────────────
+    _log.info("[6/6] Generating visualizations & report …")
+    try:
+        from medrecon_engine.visualization.report import generate_report
+        elapsed_so_far = time.perf_counter() - t_start
+        patient_id = dicom_path.name
+        report_path = generate_report(
+            ct_image, tissue_masks, vtk_meshes, output_dir,
+            patient_id=patient_id,
+            pipeline_time=elapsed_so_far,
+        )
+        _log.info("  Report: %s", report_path)
+    except Exception as exc:
+        _log.warning("  Visualization report failed (non-fatal): %s", exc)
 
     elapsed = time.perf_counter() - t_start
     _log.info("═" * 60)
