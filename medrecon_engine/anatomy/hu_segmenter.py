@@ -113,14 +113,13 @@ def segment_all(ct_image: sitk.Image) -> dict[str, sitk.Image]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _segment_bones(ct_image: sitk.Image) -> sitk.Image:
-    """Bones: threshold > 300 HU, keep top 15 CC, morphological closing.
+    """Bones: threshold > 300 HU, keep top 20 CC, closing.
 
-    300 HU lower bound cleanly separates bone from intestinal contrast
-    (200–300 HU).  Captures trabecular (300–900) and cortical (>900).
     Pipeline:
-      1. HU threshold [300, 3000]
-      2. Keep top-15 connected components (spine, pelvis, ribs, femurs…)
-      3. Binary closing [2,2,2] — fills internal trabecular pores
+      1. Trabecular (300–900 HU) | Cortical (>900 HU) combined mask
+      2. Morphological opening [1,1,1] — break thin bridges to intestine
+      3. Keep top-20 connected components (all major skeletal structures)
+      4. Binary closing [2,2,2] — fills internal trabecular pores
     """
     spec = HU_RANGES["bones"]
     mask = sitk.BinaryThreshold(
@@ -131,8 +130,11 @@ def _segment_bones(ct_image: sitk.Image) -> sitk.Image:
     )
     mask = sitk.Cast(mask, sitk.sitkUInt8)
 
-    # Keep top 15 largest connected components
-    mask = _keep_top_n_components(mask, n=15)
+    # Break thin tissue bridges between bone and intestinal contrast
+    mask = sitk.BinaryMorphologicalOpening(mask, [1, 1, 1], sitk.sitkBall, 0, 1)
+
+    # Keep top 20 largest connected components
+    mask = _keep_top_n_components(mask, n=20)
 
     # Fill internal trabecular pores and small gaps
     mask = sitk.BinaryMorphologicalClosing(mask, [2, 2, 2], sitk.sitkBall, 1)
@@ -141,61 +143,111 @@ def _segment_bones(ct_image: sitk.Image) -> sitk.Image:
 
 
 def _segment_lungs(ct_image: sitk.Image) -> sitk.Image:
-    """Lungs: threshold -950 to -650 HU, keep 2 largest CC, close holes.
+    """Lungs: threshold -950 to -650 HU, exclude exterior air, keep 2 CC.
 
-    Lungs are very reliable due to extreme HU values.  The airways
-    create internal holes which are filled with morphological closing.
+    Outside-body air also falls in [-950, -650] so we must exclude it.
+    Pipeline:
+      1. Build a body mask (HU > -400, fill holes, largest CC)
+      2. Threshold [-950, -650] AND body interior
+      3. Keep 2 largest CC (left + right lung)
+      4. Morphological closing [4,4,4] to fill airways
     """
     spec = HU_RANGES["lungs"]
-    mask = sitk.BinaryThreshold(
+
+    # Step 1: body mask — everything above -400 HU is "not air"
+    body = sitk.BinaryThreshold(
+        ct_image,
+        lowerThreshold=-400,
+        upperThreshold=3000,
+        insideValue=1, outsideValue=0,
+    )
+    body = sitk.Cast(body, sitk.sitkUInt8)
+    # Close gaps in the body silhouette
+    body = sitk.BinaryMorphologicalClosing(body, [15, 15, 15], sitk.sitkBall, 1)
+    # Fill interior holes so lungs are inside the body
+    body = sitk.BinaryFillhole(body)
+
+    # Step 2: lung-air threshold intersected with body interior
+    lung_air = sitk.BinaryThreshold(
         ct_image,
         lowerThreshold=spec.hu_low,
         upperThreshold=spec.hu_high,
         insideValue=1, outsideValue=0,
     )
-    mask = sitk.Cast(mask, sitk.sitkUInt8)
+    lung_air = sitk.Cast(lung_air, sitk.sitkUInt8)
+    mask = sitk.And(lung_air, body)
 
-    # Keep only the two lungs (left + right)
+    # Step 3: keep only the two largest components (left + right lung)
     mask = _keep_top_n_components(mask, n=2)
 
-    # Fill airways / holes with morphological closing
-    mask = sitk.BinaryMorphologicalClosing(mask, [3, 3, 3], sitk.sitkBall, 1)
+    # Step 4: fill airways / holes with morphological closing
+    mask = sitk.BinaryMorphologicalClosing(mask, [4, 4, 4], sitk.sitkBall, 1)
 
     return mask
 
 
 def _segment_liver(ct_image: sitk.Image) -> sitk.Image:
-    """Liver: threshold 30–80 HU, restricted to right-abdomen ROI.
+    """Liver: seeded region growing 40–70 HU from right-abdomen seed.
 
-    Region-growing leaks into surrounding soft tissue because the
-    liver shares HU values with muscle / intestines.  Instead we:
-    1. Threshold [30, 80] on the whole volume
-    2. Zero out everything outside the right-abdomen quadrant
-    3. Morphological opening to break thin tissue bridges
-    4. Keep only the single largest blob (= liver)
-    5. Morphological closing to fill internal vessels / gaps
+    Pipeline:
+      1. Find seed point in right-abdomen (where liver always is)
+      2. ConnectedThreshold region growing [40, 70]
+      3. If region growing is reasonable, use it; otherwise ROI fallback
+      4. Morphological closing [3,3,3] to fill vessels
+      5. Keep largest CC only
     """
     spec = HU_RANGES["liver"]
 
-    # Step 1: global HU threshold
+    # Step 1: find seed in right abdomen
+    seed = _find_liver_seed(ct_image, spec.hu_low, spec.hu_high)
+
+    if seed is not None:
+        # Step 2: seeded region growing
+        grown = sitk.ConnectedThreshold(
+            ct_image,
+            seedList=[seed],
+            lower=spec.hu_low,
+            upper=spec.hu_high,
+            replaceValue=1,
+        )
+        grown = sitk.Cast(grown, sitk.sitkUInt8)
+        grown_count = int(np.count_nonzero(sitk.GetArrayViewFromImage(grown)))
+        _log.info("    liver: region growing from %s → %d voxels", seed, grown_count)
+
+        # If region growing is reasonable (<5M voxels), use it
+        if 50_000 < grown_count < 5_000_000:
+            mask = grown
+        else:
+            _log.info("    liver: region growing out of range, using ROI fallback")
+            mask = _liver_roi_fallback(ct_image)
+    else:
+        _log.info("    liver: no seed found, using ROI fallback")
+        mask = _liver_roi_fallback(ct_image)
+
+    # Step 3: morphological closing to fill internal vessels
+    mask = sitk.BinaryMorphologicalClosing(mask, [3, 3, 3], sitk.sitkBall, 1)
+
+    # Step 4: keep only the single largest blob
+    mask = _keep_top_n_components(mask, n=1)
+
+    return mask
+
+
+def _liver_roi_fallback(ct_image: sitk.Image) -> sitk.Image:
+    """Fallback liver segmentation: wider HU range [30,80] in right-abdomen ROI."""
+    # Use wider HU range for fallback since diffusion blurs boundaries
     mask = sitk.BinaryThreshold(
         ct_image,
-        lowerThreshold=spec.hu_low,
-        upperThreshold=spec.hu_high,
+        lowerThreshold=30,
+        upperThreshold=80,
         insideValue=1, outsideValue=0,
     )
     mask = sitk.Cast(mask, sitk.sitkUInt8)
 
-    # Step 2: restrict to right-abdomen ROI
-    # Liver sits in the right half (x > midpoint), middle 60% of z
     arr = sitk.GetArrayFromImage(mask)  # (z, y, x)
     zs, ys, xs = arr.shape
-
-    z0 = int(zs * 0.20)
-    z1 = int(zs * 0.80)
+    z0, z1 = int(zs * 0.25), int(zs * 0.75)
     x_mid = xs // 2
-
-    # Zero out left half and top/bottom z
     arr[:z0, :, :] = 0
     arr[z1:, :, :] = 0
     arr[:, :, :x_mid] = 0
@@ -204,28 +256,24 @@ def _segment_liver(ct_image: sitk.Image) -> sitk.Image:
     mask.CopyInformation(ct_image)
     mask = sitk.Cast(mask, sitk.sitkUInt8)
 
-    # Step 3: morphological opening to break thin bridges to other tissues
-    mask = sitk.BinaryMorphologicalOpening(mask, [3, 3, 3], sitk.sitkBall, 0, 1)
-
-    # Step 4: keep the single largest connected component (the liver)
+    # Light opening to break thin bridges (less aggressive than [3,3,3])
+    mask = sitk.BinaryMorphologicalOpening(mask, [1, 1, 1], sitk.sitkBall, 0, 1)
     mask = _keep_top_n_components(mask, n=1)
-
-    # Step 5: morphological closing to fill internal vessels / gaps
-    mask = sitk.BinaryMorphologicalClosing(mask, [5, 5, 5], sitk.sitkBall, 1)
-
     return mask
 
 
 def _segment_kidneys(ct_image: sitk.Image) -> sitk.Image:
-    """Kidneys: threshold 20–45 HU, restrict to mid-volume, keep top 2.
+    """Kidneys: threshold 20–45 HU, restrict to T12–L3, keep top 2.
 
-    Kidneys sit roughly in the middle 40% of the axial (z) range
-    and posterior half of the volume.  We crop the search region
-    to reduce false positives from overlapping soft tissue.
+    Pipeline:
+      1. HU threshold [20, 45]
+      2. Restrict to z=30–70% (T12–L3 vertebrae region)
+      3. Keep top-2 CC (left + right kidney)
+      4. Closing [3,3,3]
     """
     spec = HU_RANGES["kidneys"]
 
-    # Step 1: HU threshold on full volume
+    # Step 1: HU threshold
     mask = sitk.BinaryThreshold(
         ct_image,
         lowerThreshold=spec.hu_low,
@@ -234,15 +282,14 @@ def _segment_kidneys(ct_image: sitk.Image) -> sitk.Image:
     )
     mask = sitk.Cast(mask, sitk.sitkUInt8)
 
-    # Step 2: restrict to mid-volume vertical band (T12–L3 region)
-    # Kidneys are roughly in the middle 40% of z-axis
-    size = ct_image.GetSize()   # (x, y, z)
-    z_total = size[2]
-    z_start = int(z_total * 0.30)
-    z_end   = int(z_total * 0.70)
-
-    # Zero out voxels outside the kidney vertical band
+    # Step 2: restrict to T12–L3 vertical band
     arr = sitk.GetArrayFromImage(mask)  # (z, y, x)
+    zs, ys, xs = arr.shape
+
+    z_start = int(zs * 0.30)
+    z_end   = int(zs * 0.70)
+
+    # Zero outside kidney z-band
     arr[:z_start, :, :] = 0
     arr[z_end:,   :, :] = 0
 
@@ -250,7 +297,7 @@ def _segment_kidneys(ct_image: sitk.Image) -> sitk.Image:
     mask.CopyInformation(ct_image)
     mask = sitk.Cast(mask, sitk.sitkUInt8)
 
-    # Step 3: keep the two largest symmetric blobs
+    # Step 3: keep the two largest blobs (left + right kidney)
     mask = _keep_top_n_components(mask, n=2)
 
     # Step 4: morphological closing

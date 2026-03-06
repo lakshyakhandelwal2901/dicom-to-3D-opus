@@ -41,7 +41,7 @@ HU_RANGES: dict[str, HUSpec] = {
     "lungs":           HUSpec(-950,  -650, filename="lungs",   category="lungs"),
 
     # ── Soft-tissue organs ────────────────────────────────────────────
-    "liver":           HUSpec(  30,    80, filename="liver",   category="organs"),
+    "liver":           HUSpec(  40,    70, filename="liver",   category="organs"),
     "kidneys":         HUSpec(  20,    45, filename="kidneys", category="organs"),
 }
 
