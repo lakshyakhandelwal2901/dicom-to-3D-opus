@@ -106,6 +106,7 @@ class MedicalReport:
     patient: PatientInfo = field(default_factory=PatientInfo)
     tissue: TissueStats = field(default_factory=TissueStats)
     findings: list[Finding] = field(default_factory=list)
+    skipped_organs: dict[str, str] = field(default_factory=dict)  # organ -> reason
     scan_quality: str = "Adequate"
     scan_coverage: str = ""
     volume_size: tuple[int, int, int] = (0, 0, 0)
@@ -821,6 +822,110 @@ def _analyze_spine(ct_arr: np.ndarray, stats: TissueStats,
         ))
 
 
+def _check_organ_coverage(
+    ct_arr: np.ndarray,
+    spacing: tuple[float, float, float],
+) -> dict[str, str]:
+    """Detect organs that are truncated at scan boundaries.
+
+    For each organ we check if characteristic-HU tissue appears in the
+    edge slices of the volume.  If a significant amount of organ-density
+    tissue is present at the very top or bottom of the scan, the organ is
+    likely cut off and cannot be reliably analysed.
+
+    Returns
+    -------
+    dict  mapping  organ-name -> reason string  for every organ that
+    should be **skipped** in the report.
+    """
+    z_size = ct_arr.shape[0]
+    edge_n = max(5, int(z_size * 0.02))  # ~2 % of slices at each boundary
+    vox_ml = spacing[0] * spacing[1] * spacing[2] / 1000.0
+
+    top_slices = ct_arr[:edge_n, :, :]      # superior
+    bot_slices = ct_arr[-edge_n:, :, :]     # inferior
+
+    skipped: dict[str, str] = {}
+
+    # ── Lungs (-950 to -650 HU) ─────────────────────────────────
+    #   Expect lungs in superior portion; if heavy lung tissue at the
+    #   very top boundary, the apex is truncated.
+    lung_top = float(np.count_nonzero(
+        (top_slices >= -950) & (top_slices <= -650))) * vox_ml
+    lung_bot = float(np.count_nonzero(
+        (bot_slices >= -950) & (bot_slices <= -650))) * vox_ml
+    # Threshold: > 50 mL of lung tissue at the boundary
+    if lung_top > 50:
+        skipped["Lungs"] = (
+            f"Lung tissue ({lung_top:.0f} mL) detected at the superior scan "
+            "boundary — lung apex is truncated; findings would be unreliable."
+        )
+    elif lung_bot > 50:
+        skipped["Lungs"] = (
+            f"Lung tissue ({lung_bot:.0f} mL) detected at the inferior scan "
+            "boundary — lung base is truncated; findings would be unreliable."
+        )
+
+    # ── Liver (40-70 HU, right abdomen z 20-75 %) ───────────────
+    #   Liver sits roughly in z 20-75 %.  If liver-density tissue is
+    #   heavy at the top or bottom boundary, the liver is cut off.
+    x_mid = ct_arr.shape[2] // 2
+    liver_top = float(np.count_nonzero(
+        (top_slices[:, :, x_mid:] >= 40) &
+        (top_slices[:, :, x_mid:] <= 70)
+    )) * vox_ml
+    liver_bot = float(np.count_nonzero(
+        (bot_slices[:, :, x_mid:] >= 40) &
+        (bot_slices[:, :, x_mid:] <= 70)
+    )) * vox_ml
+    if liver_top > 80:
+        skipped["Liver"] = (
+            f"Liver-range tissue ({liver_top:.0f} mL) at the superior "
+            "boundary — liver dome is truncated."
+        )
+    elif liver_bot > 80:
+        skipped["Liver"] = (
+            f"Liver-range tissue ({liver_bot:.0f} mL) at the inferior "
+            "boundary — liver inferior segments are truncated."
+        )
+
+    # ── Kidneys (20-45 HU, bilateral, z 30-70 %) ───────────────
+    kidney_top = float(np.count_nonzero(
+        (top_slices >= 20) & (top_slices <= 45))) * vox_ml
+    kidney_bot = float(np.count_nonzero(
+        (bot_slices >= 20) & (bot_slices <= 45))) * vox_ml
+    if kidney_top > 60:
+        skipped["Kidneys"] = (
+            f"Kidney-range tissue ({kidney_top:.0f} mL) at the superior "
+            "boundary — kidneys may be truncated."
+        )
+    elif kidney_bot > 60:
+        skipped["Kidneys"] = (
+            f"Kidney-range tissue ({kidney_bot:.0f} mL) at the inferior "
+            "boundary — kidneys may be truncated."
+        )
+
+    # ── Spine: runs the full length of the body — always partially
+    #   captured.  Only skip if the scan is very short (<100 slices).
+    if z_size < 100:
+        skipped["Spine"] = (
+            f"Scan has only {z_size} slices — insufficient for spine analysis."
+        )
+
+    # ── Abdomen: skip if scan covers < 200 mm in z ─────────────
+    z_extent_mm = z_size * spacing[2]
+    if z_extent_mm < 200:
+        skipped["Abdomen"] = (
+            f"Scan z-extent is only {z_extent_mm:.0f} mm — too short for "
+            "reliable abdominal assessment."
+        )
+
+    # ── Bones: always partially captured, never skip ────────────
+    #   (skeletal structures are distributed throughout the body)
+
+    return skipped
+
+
 def _determine_scan_coverage(ct_arr: np.ndarray, spacing: tuple) -> str:
     """Determine approximate body region covered by the scan."""
     z_extent_mm = ct_arr.shape[0] * spacing[2]
@@ -917,6 +1022,28 @@ def _build_html_report(report: MedicalReport, hist_b64: str, pie_b64: str) -> st
         </div>
     </div>"""
 
+    # ── Skipped organs section ────────────────────────────────
+    skipped_html = ""
+    if report.skipped_organs:
+        cards = ""
+        for organ, reason in report.skipped_organs.items():
+            cards += f"""
+            <div class="skipped-card">
+                <span class="organ-tag">{organ}</span>
+                <span class="reason">{reason}</span>
+            </div>"""
+        skipped_html = f"""
+    <div class="skipped-section">
+        <h2 style="color:#8b949e; border-left:4px solid #8b949e; padding-left:10px; border-radius:2px;">
+            &#128683; Organs Skipped (Not Fully Captured)
+        </h2>
+        <p style="color:#8b949e; font-size:13px; margin:8px 0 12px 0;">
+            The following organs were detected as truncated at the scan boundary.
+            Analysis was skipped to avoid unreliable findings.
+        </p>
+        {cards}
+    </div>"""
+
     # ── Findings grouped by category ──────────────────────────
     categories_order = ["abnormal", "risk", "incidental", "normal"]
     category_labels = {
@@ -983,6 +1110,10 @@ def _build_html_report(report: MedicalReport, hist_b64: str, pie_b64: str) -> st
         summary_text = f"{n_abnormal} abnormal finding(s) detected. Clinical correlation recommended."
     else:
         summary_text = "No significant abnormalities detected on automated analysis."
+
+    n_skipped = len(report.skipped_organs)
+    if n_skipped:
+        summary_text += f" ({n_skipped} organ(s) skipped — not fully captured in scan.)"
 
     # ── Assemble full HTML ────────────────────────────────────
     html = f"""<!DOCTYPE html>
@@ -1170,6 +1301,34 @@ def _build_html_report(report: MedicalReport, hist_b64: str, pie_b64: str) -> st
         border: 1px solid #30363d;
         margin: 10px 0;
     }}
+    .skipped-section {{
+        margin: 20px 0;
+    }}
+    .skipped-card {{
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-left: 3px solid #8b949e;
+        border-radius: 8px;
+        padding: 12px 18px;
+        margin: 8px 0;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    }}
+    .skipped-card .organ-tag {{
+        background: #21262d;
+        color: #8b949e;
+        padding: 2px 10px;
+        border-radius: 12px;
+        font-size: 12px;
+        font-weight: 600;
+        min-width: 70px;
+        text-align: center;
+    }}
+    .skipped-card .reason {{
+        color: #8b949e;
+        font-size: 13px;
+    }}
     .footer {{
         text-align: center;
         color: #484f58;
@@ -1207,6 +1366,8 @@ def _build_html_report(report: MedicalReport, hist_b64: str, pie_b64: str) -> st
 
 <h2>&#128100; Patient & Study Information</h2>
 {patient_html}
+
+{skipped_html}
 
 <h2>&#128269; Key Findings</h2>
 {findings_html}
@@ -1289,16 +1450,29 @@ def generate_medical_report(
     _log.info("  [3/5] Analyzing tissue composition …")
     tissue_stats = _compute_tissue_stats(ct_arr, voxel_vol_mm3)
 
-    # ── Step 4: Generate findings ─────────────────────────────────
-    _log.info("  [4/5] Generating clinical findings …")
+    # ── Step 4: Check organ coverage & generate findings ─────────
+    _log.info("  [4/5] Checking organ coverage & generating findings …")
+    skipped_organs = _check_organ_coverage(ct_arr, spacing)
+    if skipped_organs:
+        _log.info("  Organs skipped (not fully captured): %s",
+                  ", ".join(skipped_organs.keys()))
+
     findings: list[Finding] = []
 
-    _analyze_lungs(ct_arr, tissue_stats, findings)
-    _analyze_bones(ct_arr, tissue_stats, findings)
-    _analyze_liver(ct_arr, tissue_stats, findings)
-    _analyze_kidneys(ct_arr, tissue_stats, findings)
-    _analyze_abdomen(ct_arr, tissue_stats, findings)
-    _analyze_spine(ct_arr, tissue_stats, findings)
+    # Map organ names → their analysis functions
+    _organ_analyzers: list[tuple[str, object]] = [
+        ("Lungs",   _analyze_lungs),
+        ("Bones",   _analyze_bones),
+        ("Liver",   _analyze_liver),
+        ("Kidneys", _analyze_kidneys),
+        ("Abdomen", _analyze_abdomen),
+        ("Spine",   _analyze_spine),
+    ]
+    for organ_name, analyzer_fn in _organ_analyzers:
+        if organ_name in skipped_organs:
+            _log.info("    Skipping %s: %s", organ_name, skipped_organs[organ_name])
+            continue
+        analyzer_fn(ct_arr, tissue_stats, findings)
 
     # Assess scan quality
     scan_quality = "Adequate"
@@ -1314,6 +1488,7 @@ def generate_medical_report(
         patient=patient_info,
         tissue=tissue_stats,
         findings=findings,
+        skipped_organs=skipped_organs,
         scan_quality=scan_quality,
         scan_coverage=_determine_scan_coverage(ct_arr, spacing),
         volume_size=ct_image.GetSize(),
