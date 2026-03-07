@@ -29,7 +29,10 @@ import time
 from typing import Callable
 
 import numpy as np
+import scipy.ndimage as _ndi
 import SimpleITK as sitk
+from scipy.interpolate import interp1d as _interp1d
+from scipy.signal import medfilt as _medfilt
 
 from medrecon_engine.audit.logger import get_logger
 from medrecon_engine.config.hu_ranges import HU_RANGES, STRUCTURE_ORDER
@@ -296,10 +299,6 @@ def _segment_kidneys(ct: sitk.Image) -> sitk.Image:
     cross-section.  The per-slice tracking avoids false CC selection
     by anchoring on the spine landmark.
     """
-    import scipy.ndimage as _ndi
-    from scipy.interpolate import interp1d as _interp1d
-    from scipy.signal import medfilt as _medfilt
-
     arr_ct = sitk.GetArrayViewFromImage(ct)
     zs, ys, xs = arr_ct.shape
     spacing = ct.GetSpacing()  # (x_sp, y_sp, z_sp)
@@ -316,15 +315,16 @@ def _segment_kidneys(ct: sitk.Image) -> sitk.Image:
 
     # ── Step 1: Spine landmark per axial slice ───────────────────────
     _log.info("    kidneys: locating spine landmarks …")
-    spine_x = np.full(z_hi - z_lo, xs // 2, dtype=np.intp)
-    spine_y = np.full(z_hi - z_lo, ys // 2, dtype=np.intp)
+    n_slices = z_hi - z_lo
+    spine_x = np.full(n_slices, xs // 2, dtype=np.intp)
+    spine_y = np.full(n_slices, ys // 2, dtype=np.intp)
 
-    for zi, z in enumerate(range(z_lo, z_hi)):
-        bone_slice = arr_ct[z] > 250
+    for zi in range(n_slices):
+        bone_slice = arr_ct[z_lo + zi] > 250
         if not bone_slice.any():
             continue
         labeled, n_cc = _ndi.label(bone_slice)
-        sizes = _ndi.sum(np.ones_like(labeled), labeled, range(1, n_cc + 1))
+        sizes = np.bincount(labeled.ravel())[1:]  # skip background 0
         best = int(np.argmax(sizes)) + 1
         ys_c, xs_c = np.where(labeled == best)
         spine_x[zi] = int(np.median(xs_c))
@@ -346,45 +346,73 @@ def _segment_kidneys(ct: sitk.Image) -> sitk.Image:
     result = np.zeros((zs, ys, xs), dtype=np.uint8)
     found_sides = 0
 
+    # ── Pre-compute per-slice CC labeling (reused for both sides) ────
+    expected_lat_px = int(EXPECTED_LAT_MM / x_sp)
+    expected_ant_px = int(EXPECTED_ANT_MM / y_sp)
+    min_lat_px = int(MIN_LAT_MM / x_sp)
+
+    # Store per-slice CC data: (labeled_2d, cc_sizes_arr, cc_centroids, sx_c, sy_c)
+    slice_cc_cache: list[tuple | None] = [None] * n_slices
+
+    for zi in range(n_slices):
+        slc = arr_ct[z_lo + zi]
+        sx_c, sy_c = int(spine_x[zi]), int(spine_y[zi])
+
+        # Soft-tissue threshold in posterior half of body
+        soft = (slc >= 0) & (slc <= 60)
+        y_lo_post = max(0, sy_c - 70)   # ~55 mm anterior
+        y_hi_post = min(ys, sy_c + 15)  # ~12 mm posterior
+        # Zero-out non-posterior rows in-place (avoids post_mask alloc)
+        soft[:y_lo_post, :] = False
+        soft[y_hi_post:, :] = False
+
+        labeled_2d, n_cc = _ndi.label(soft)
+        if n_cc == 0:
+            continue
+
+        # Fast CC sizes + centroids via bincount and find_objects
+        cc_sizes = np.bincount(labeled_2d.ravel())  # index 0 = background
+        obj_slices = _ndi.find_objects(labeled_2d)   # list of (y_slice, x_slice)
+
+        # Precompute centroid (median) per valid CC
+        cc_info = []  # (lbl, size, cx, cy)
+        for lbl_idx, slc_pair in enumerate(obj_slices):
+            lbl = lbl_idx + 1
+            sz_v = int(cc_sizes[lbl])
+            if sz_v < MIN_CC_PX or sz_v > MAX_CC_PX:
+                cc_info.append(None)
+                continue
+            sub = labeled_2d[slc_pair]
+            local_ys, local_xs = np.where(sub == lbl)
+            cx = float(np.median(local_xs + slc_pair[1].start))
+            cy = float(np.median(local_ys + slc_pair[0].start))
+            cc_info.append((lbl, sz_v, cx, cy))
+
+        slice_cc_cache[zi] = (cc_info, sx_c, sy_c)
+
     for side_name, side_sign in [("left", -1), ("right", 1)]:
         # Collect centroids for this side
         centroids = []  # (zi, cx, cy, z_global)
 
-        for zi, z in enumerate(range(z_lo, z_hi)):
-            slc = arr_ct[z]
-            sx_c, sy_c = int(spine_x[zi]), int(spine_y[zi])
-
-            # Soft-tissue threshold in posterior half of body
-            soft = (slc >= 0) & (slc <= 60)
-            y_lo_post = max(0, sy_c - int(70))  # ~55 mm anterior
-            y_hi_post = min(ys, sy_c + int(15))  # ~12 mm posterior
-            post_mask = np.zeros_like(soft)
-            post_mask[y_lo_post:y_hi_post, :] = True
-            soft = soft & post_mask
-
-            labeled_2d, n_cc = _ndi.label(soft)
-            if n_cc == 0:
+        for zi in range(n_slices):
+            cached = slice_cc_cache[zi]
+            if cached is None:
                 continue
-            cc_sizes = _ndi.sum(
-                np.ones_like(labeled_2d), labeled_2d, range(1, n_cc + 1))
+            cc_info, sx_c, sy_c = cached
 
-            expected_x = sx_c + side_sign * int(EXPECTED_LAT_MM / x_sp)
-            expected_y = sy_c - int(EXPECTED_ANT_MM / y_sp)
+            expected_x = sx_c + side_sign * expected_lat_px
+            expected_y = sy_c - expected_ant_px
 
             best_score = -1.0
             best_info = None
 
-            for lbl in range(1, n_cc + 1):
-                sz_v = int(cc_sizes[lbl - 1])
-                if sz_v < MIN_CC_PX or sz_v > MAX_CC_PX:
+            for entry in cc_info:
+                if entry is None:
                     continue
-
-                ys_i, xs_i = np.where(labeled_2d == lbl)
-                cx, cy = float(np.median(xs_i)), float(np.median(ys_i))
+                _lbl, sz_v, cx, cy = entry
 
                 # Must be on correct side of spine
-                lat_offset_mm = (cx - sx_c) * side_sign * x_sp
-                if lat_offset_mm < MIN_LAT_MM:
+                if (cx - sx_c) * side_sign < min_lat_px:
                     continue
 
                 dx_mm = (cx - expected_x) * x_sp
@@ -396,7 +424,7 @@ def _segment_kidneys(ct: sitk.Image) -> sitk.Image:
                 score = sz_v / (1.0 + dist)
                 if score > best_score:
                     best_score = score
-                    best_info = (zi, cx, cy, float(z))
+                    best_info = (zi, cx, cy, float(z_lo + zi))
 
             if best_info is not None:
                 centroids.append(best_info)
@@ -409,12 +437,10 @@ def _segment_kidneys(ct: sitk.Image) -> sitk.Image:
         centroids = np.array(centroids)
         cx_all = centroids[:, 1]
         cy_all = centroids[:, 2]
-        z_all = centroids[:, 3]
 
         # ── Step 3: Smooth trajectory + outlier rejection ────────────
-        k = min(21, len(cx_all) if len(cx_all) % 2 == 1
-                else len(cx_all) - 1)
-        k = max(3, k)
+        n_pts = len(cx_all)
+        k = max(3, min(21, n_pts if n_pts % 2 == 1 else n_pts - 1))
         smooth_cx = _medfilt(cx_all, kernel_size=k)
         smooth_cy = _medfilt(cy_all, kernel_size=k)
 
@@ -432,8 +458,8 @@ def _segment_kidneys(ct: sitk.Image) -> sitk.Image:
                   side_name, len(centroids), len(good))
 
         # Re-smooth after filtering
-        k2 = max(3, min(21, len(good) if len(good) % 2 == 1
-                         else len(good) - 1))
+        n_good = len(good)
+        k2 = max(3, min(21, n_good if n_good % 2 == 1 else n_good - 1))
         smooth_cx2 = _medfilt(good[:, 1], kernel_size=k2)
         smooth_cy2 = _medfilt(good[:, 2], kernel_size=k2)
 
@@ -448,15 +474,19 @@ def _segment_kidneys(ct: sitk.Image) -> sitk.Image:
 
         # ── Step 5: Tubular ROI + HU threshold ──────────────────────
         kidney_tube = np.zeros((zs, ys, xs), dtype=bool)
-        Y_grid, X_grid = np.ogrid[:ys, :xs]
+        # Precompute pixel-coordinate grids (scaled to mm)
+        X_mm = np.arange(xs, dtype=np.float32) * x_sp
+        Y_mm = np.arange(ys, dtype=np.float32) * y_sp
+        tube_r_sq = TUBE_RADIUS_MM ** 2
 
         for z in range(z_range_min, z_range_max + 1):
-            cx_z = float(f_cx(z))
-            cy_z = float(f_cy(z))
-            dist_sq = ((X_grid - cx_z) * x_sp) ** 2 \
-                    + ((Y_grid - cy_z) * y_sp) ** 2
-            circle = dist_sq <= (TUBE_RADIUS_MM ** 2)
-            kidney_tube[z] = circle & (arr_ct[z] >= 10) & (arr_ct[z] <= 55)
+            cx_mm = float(f_cx(z)) * x_sp
+            cy_mm = float(f_cy(z)) * y_sp
+            dx = X_mm - cx_mm  # (xs,)
+            dy = Y_mm - cy_mm  # (ys,)
+            dist_sq = dy[:, None] ** 2 + dx[None, :] ** 2  # (ys, xs)
+            kidney_tube[z] = (dist_sq <= tube_r_sq) & \
+                             (arr_ct[z] >= 10) & (arr_ct[z] <= 55)
 
         # ── Step 6: Largest 3D connected component ───────────────────
         labeled_3d, n_3d = _ndi.label(kidney_tube)
@@ -464,8 +494,7 @@ def _segment_kidneys(ct: sitk.Image) -> sitk.Image:
             _log.info("    kidneys: %s — tube produced no components", side_name)
             continue
 
-        sizes_3d = _ndi.sum(
-            np.ones_like(labeled_3d), labeled_3d, range(1, n_3d + 1))
+        sizes_3d = np.bincount(labeled_3d.ravel())[1:]  # skip bg
         best_3d = int(np.argmax(sizes_3d)) + 1
         kidney_side = (labeled_3d == best_3d).astype(np.uint8)
 
@@ -537,35 +566,19 @@ def _segment_kidney_stones(ct: sitk.Image, kidney_mask: sitk.Image) -> sitk.Imag
     mid_x = xs // 2
 
     corridor = np.zeros((zs, ys, xs), dtype=np.uint8)
+    r = max(20, int(0.03 * xs))  # ~3 cm radius in voxels
 
-    # Left kidney → left ureter column
-    left_region = k_arr[:, :, :mid_x]
-    if np.any(left_region):
-        z_idx, y_idx, x_idx = np.where(left_region)
-        x_center = int(np.median(x_idx))
-        y_center = int(np.median(y_idx))
-        z_bottom = int(np.min(z_idx))
-        # Column from bottom of kidney down to pelvis, ~3cm wide
-        r = max(20, int(0.03 * xs))  # ~3 cm radius in voxels
-        y_lo = max(0, y_center - r)
-        y_hi = min(ys, y_center + r)
-        x_lo = max(0, x_center - r)
-        x_hi = min(mid_x, x_center + r)
-        corridor[:z_bottom, y_lo:y_hi, x_lo:x_hi] = 1
-
-    # Right kidney → right ureter column
-    right_region = k_arr[:, :, mid_x:]
-    if np.any(right_region):
-        z_idx, y_idx, x_idx = np.where(right_region)
-        x_center = int(np.median(x_idx)) + mid_x
-        y_center = int(np.median(y_idx))
-        z_bottom = int(np.min(z_idx))
-        r = max(20, int(0.03 * xs))
-        y_lo = max(0, y_center - r)
-        y_hi = min(ys, y_center + r)
-        x_lo = max(mid_x, x_center - r)
-        x_hi = min(xs, x_center + r)
-        corridor[:z_bottom, y_lo:y_hi, x_lo:x_hi] = 1
+    for x_lo_bound, x_hi_bound, x_offset in [(0, mid_x, 0), (mid_x, xs, mid_x)]:
+        region = k_arr[:, :, x_lo_bound:x_hi_bound]
+        if not np.any(region):
+            continue
+        z_idx, y_idx, x_idx = np.where(region)
+        x_c = int(np.median(x_idx)) + x_offset
+        y_c = int(np.median(y_idx))
+        z_bot = int(np.min(z_idx))
+        y0, y1 = max(0, y_c - r), min(ys, y_c + r)
+        x0, x1 = max(x_lo_bound, x_c - r), min(x_hi_bound, x_c + r)
+        corridor[:z_bot, y0:y1, x0:x1] = 1
 
     corridor_img = sitk.GetImageFromArray(corridor)
     corridor_img.CopyInformation(ct)
@@ -618,35 +631,31 @@ def _keep_by_size(
     cc = sitk.ConnectedComponent(mask)
     relabeled = sitk.RelabelComponent(cc, sortByObjectSize=True)
     arr = sitk.GetArrayFromImage(relabeled)
+    max_label = int(arr.max())
 
-    labels = np.unique(arr)
-    labels = labels[labels > 0]  # skip background
+    # Single-pass size computation for all labels
+    counts = np.bincount(arr.ravel(), minlength=max_label + 1)
 
     kept = 0
     result = np.zeros_like(arr, dtype=np.uint8)
 
-    for label in labels:
-        count = int(np.count_nonzero(arr == label))
-        if count < min_voxels:
-            # Labels are sorted by size — all remaining are smaller
-            break
-        if count <= max_voxels:
+    for label in range(1, max_label + 1):
+        cnt = int(counts[label])
+        if cnt < min_voxels:
+            break  # labels sorted by size — rest are smaller
+        if cnt <= max_voxels:
             result[arr == label] = 1
             kept += 1
-            _log.info("    size-filter: label %d = %d voxels — kept", label, count)
+            _log.info("    size-filter: label %d = %d voxels — kept", label, cnt)
             if kept >= max_count:
                 break
         else:
             _log.info("    size-filter: label %d = %d voxels — too large, skipped",
-                      label, count)
+                      label, cnt)
 
     if kept == 0:
         _log.info("    size-filter: no components in [%d, %d] range",
                   min_voxels, max_voxels)
-        # Return empty mask — let caller decide what to do
-        out = sitk.GetImageFromArray(result)
-        out.CopyInformation(mask)
-        return sitk.Cast(out, sitk.sitkUInt8)
 
     out = sitk.GetImageFromArray(result)
     out.CopyInformation(mask)
