@@ -116,6 +116,7 @@ class MedicalReport:
     hu_mean: float = 0.0
     hu_std: float = 0.0
     analysis_time: float = 0.0
+    ai_analysis: str = ""  # MedGemma AI interpretation (empty if unavailable)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1115,6 +1116,30 @@ def _build_html_report(report: MedicalReport, hist_b64: str, pie_b64: str) -> st
     if n_skipped:
         summary_text += f" ({n_skipped} organ(s) skipped — not fully captured in scan.)"
 
+    # ── AI Summary & Recommendations ────────────────────────────
+    ai_extras_html = ""
+    if report.ai_analysis:
+        import re as _re
+        parts = report.ai_analysis.split("\n\n", 1)
+        ai_summary = parts[0].strip() if parts else ""
+        ai_recs = parts[1].strip() if len(parts) > 1 else ""
+
+        if ai_summary:
+            ai_extras_html += f"""
+    <div style="background:#161b22; border:1px solid #30363d; border-radius:8px;
+                 padding:16px 20px; margin:12px 0 8px 0; line-height:1.6; color:#c9d1d9; font-size:14px;">
+        <strong style="color:#58a6ff;">&#128203; Overall Impression:</strong><br>
+        {ai_summary}
+    </div>"""
+
+        if ai_recs:
+            ai_extras_html += f"""
+    <div style="background:#0d1b2a; border:1px solid #1f4068; border-radius:8px;
+                 padding:16px 20px; margin:8px 0 16px 0; line-height:1.6; color:#c9d1d9; font-size:14px;">
+        <strong style="color:#3fb950;">&#128161; Recommendations:</strong><br>
+        {ai_recs}
+    </div>"""
+
     # ── Assemble full HTML ────────────────────────────────────
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1370,6 +1395,8 @@ def _build_html_report(report: MedicalReport, hist_b64: str, pie_b64: str) -> st
 {skipped_html}
 
 <h2>&#128269; Key Findings</h2>
+<p style="color:#8b949e; font-size:12px; margin:0 0 12px 0;">&#129302; Powered by Gemini AI &mdash; clinical interpretation of CT imagery</p>
+{ai_extras_html}
 {findings_html}
 
 <h2>&#129516; Tissue Composition</h2>
@@ -1405,6 +1432,8 @@ def generate_medical_report(
     output_dir: str | Path,
     *,
     ct_image: Optional[sitk.Image] = None,
+    enable_ai: bool = True,
+    medgemma_path: str | Path | None = None,
 ) -> Path:
     """Generate a comprehensive medical findings report from DICOM data.
 
@@ -1417,6 +1446,10 @@ def generate_medical_report(
     ct_image : sitk.Image | None
         Pre-loaded CT volume (avoids reloading).
         If None, will load from dicom_dir.
+    enable_ai : bool
+        If True, run Gemini AI analysis (requires internet + API key).
+    medgemma_path : str | Path | None
+        Google Gemini API key. Uses built-in default if None.
 
     Returns
     -------
@@ -1430,28 +1463,28 @@ def generate_medical_report(
     _log.info("Generating medical findings report …")
 
     # ── Step 1: Extract DICOM metadata ────────────────────────────
-    _log.info("  [1/5] Reading DICOM headers …")
+    _log.info("  [1/6] Reading DICOM headers …")
     patient_info = _extract_patient_info(dicom_dir)
 
     # ── Step 2: Load CT volume ────────────────────────────────────
     if ct_image is None:
-        _log.info("  [2/5] Loading CT volume …")
+        _log.info("  [2/6] Loading CT volume …")
         from medrecon_engine.core.volume_loader import VolumeLoader
         loader = VolumeLoader()
         ct_image = loader.load(directory=dicom_dir)
     else:
-        _log.info("  [2/5] Using pre-loaded CT volume")
+        _log.info("  [2/6] Using pre-loaded CT volume")
 
     ct_arr = sitk.GetArrayViewFromImage(ct_image)
     spacing = ct_image.GetSpacing()
     voxel_vol_mm3 = spacing[0] * spacing[1] * spacing[2]
 
     # ── Step 3: Compute tissue statistics ─────────────────────────
-    _log.info("  [3/5] Analyzing tissue composition …")
+    _log.info("  [3/6] Analyzing tissue composition …")
     tissue_stats = _compute_tissue_stats(ct_arr, voxel_vol_mm3)
 
     # ── Step 4: Check organ coverage & generate findings ─────────
-    _log.info("  [4/5] Checking organ coverage & generating findings …")
+    _log.info("  [4/6] Checking organ coverage & generating findings …")
     skipped_organs = _check_organ_coverage(ct_arr, spacing)
     if skipped_organs:
         _log.info("  Organs skipped (not fully captured): %s",
@@ -1500,8 +1533,55 @@ def generate_medical_report(
         analysis_time=time.perf_counter() - t0,
     )
 
-    # ── Step 5: Generate visuals & HTML ───────────────────────────
-    _log.info("  [5/5] Building HTML report …")
+    # ── Step 5: Gemini AI analysis (optional) ──────────────────────
+    if enable_ai:
+        _log.info("  [5/6] Running Gemini AI analysis …")
+        try:
+            from medrecon_engine.analysis.medgemma_analyzer import MedGemmaAnalyzer
+
+            analyzer = MedGemmaAnalyzer(api_key=medgemma_path)
+            ai_result = analyzer.analyze(
+                ct_arr=np.array(ct_arr),  # copy from read-only view
+                spacing=spacing,
+                patient=patient_info,
+                tissue=tissue_stats,
+                findings=findings,
+                volume_size=ct_image.GetSize(),
+            )
+            analyzer.unload()
+
+            # Replace rule-based findings with Gemini structured findings
+            gemini_findings = []
+            for f in ai_result.get("findings", []):
+                gemini_findings.append(Finding(
+                    category=f["category"],
+                    organ=f["organ"],
+                    title=f["title"],
+                    detail=f["detail"],
+                    severity=f["severity"],
+                    measurement=f.get("measurement", ""),
+                ))
+            if gemini_findings:
+                report.findings = gemini_findings
+                _log.info("  Replaced findings with %d Gemini-structured findings",
+                          len(gemini_findings))
+
+            # Store summary + recommendations for the HTML
+            report.ai_analysis = (
+                ai_result.get("summary", "") + "\n\n" +
+                ai_result.get("recommendations", "")
+            ).strip()
+
+            _log.info("  Gemini AI analysis complete (%d findings)",
+                      len(gemini_findings))
+        except Exception as exc:
+            _log.warning("  Gemini AI analysis failed: %s", exc)
+            _log.warning("  Continuing with rule-based findings")
+    else:
+        _log.info("  [5/6] Gemini AI analysis skipped (disabled)")
+
+    # ── Step 6: Generate visuals & HTML ───────────────────────────
+    _log.info("  [6/6] Building HTML report …")
     hist_b64 = _generate_hu_histogram(ct_arr)
     pie_b64 = _generate_tissue_pie(tissue_stats)
 

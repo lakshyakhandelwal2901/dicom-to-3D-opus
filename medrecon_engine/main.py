@@ -385,6 +385,8 @@ def run_hu_pipeline(
     output_dir: str | Path,
     *,
     config: Optional[PrecisionConfig] = None,
+    enable_ai: bool = True,
+    medgemma_path: str | Path | None = None,
 ) -> None:
     """Pure HU-based pipeline: DICOM → denoise → organ segmentation → mesh → OBJ → visualization.
 
@@ -526,6 +528,8 @@ def run_hu_pipeline(
             dicom_dir=dicom_path,
             output_dir=output_dir,
             ct_image=ct_image,
+            enable_ai=enable_ai,
+            medgemma_path=medgemma_path,
         )
         _log.info("  Medical findings: %s", findings_path)
     except Exception as exc:
@@ -671,6 +675,18 @@ def run_ai_pipeline(
     default=False,
     help="Export ASCII STL instead of binary.",
 )
+@click.option(
+    "--no-ai",
+    is_flag=True,
+    default=False,
+    help="Disable MedGemma AI analysis in the medical findings report.",
+)
+@click.option(
+    "--medgemma-path",
+    type=click.Path(),
+    default=None,
+    help="Custom path to local MedGemma model directory.",
+)
 def cli(
     dicom: Optional[str],
     batch_dir: Optional[str],
@@ -681,6 +697,8 @@ def cli(
     precision_mm: Optional[float],
     no_smooth: bool,
     ascii_stl: bool,
+    no_ai: bool,
+    medgemma_path: Optional[str],
 ) -> None:
     """MedRecon Engine v1 — Universal CT → Surgical 3D STL Engine."""
     console.print(
@@ -725,7 +743,7 @@ def cli(
             sys.exit(1)
         console.print(f"  Mode      : [bold green]Pure HU (threshold → morphology → gradient mesh)[/bold green]")
         console.print(f"  Output    : {output}")
-        run_hu_pipeline(dicom, output, config=cfg)
+        run_hu_pipeline(dicom, output, config=cfg, enable_ai=not no_ai, medgemma_path=medgemma_path)
         return
 
     # ── Classic segmentation branch ───────────────────────────────────
