@@ -39,6 +39,9 @@ Usage (CLI)
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+load_dotenv()  # load .env file (GEMINI_API_KEY, etc.)
+
 import sys
 import time
 from dataclasses import replace
@@ -474,11 +477,19 @@ def run_hu_pipeline(
         ct_crop = sitk.RegionOfInterest(ct_smooth, crop_size, start_idx)
         mask_crop = sitk.RegionOfInterest(mask, crop_size, start_idx)
 
-        mesh = generate_tissue_mesh(
-            ct_crop, mask_crop,
-            smooth_iterations=25,
-            smooth_passband=0.08,
-        )
+        # Kidney stones are tiny — less smoothing to preserve sharp edges
+        if structure == "kidney_stones":
+            mesh = generate_tissue_mesh(
+                ct_crop, mask_crop,
+                smooth_iterations=10,
+                smooth_passband=0.15,
+            )
+        else:
+            mesh = generate_tissue_mesh(
+                ct_crop, mask_crop,
+                smooth_iterations=25,
+                smooth_passband=0.08,
+            )
         if mesh is None:
             _log.info("    %s: empty mesh, skipping", structure)
             continue

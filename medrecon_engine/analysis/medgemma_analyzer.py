@@ -11,12 +11,13 @@ Usage::
 
     from medrecon_engine.analysis.medgemma_analyzer import MedGemmaAnalyzer
 
-    analyzer = MedGemmaAnalyzer(api_key="AIza...")
+    analyzer = MedGemmaAnalyzer()  # reads GEMINI_API_KEY env var
     result = analyzer.analyze(ct_arr, spacing, patient_info, tissue_stats, findings)
 """
 
 from __future__ import annotations
 
+import os
 import time
 from io import BytesIO
 from pathlib import Path
@@ -35,7 +36,7 @@ if TYPE_CHECKING:
 _log = get_logger(__name__)
 
 # Gemini API configuration
-DEFAULT_API_KEY = "REMOVED_KEY"
+DEFAULT_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 DEFAULT_MODEL = "gemini-2.5-flash"
 
 
@@ -203,7 +204,7 @@ class MedGemmaAnalyzer:
     Parameters
     ----------
     api_key : str | None
-        Google Gemini API key. Uses built-in default if None.
+        Google Gemini API key. Falls back to GEMINI_API_KEY env var if None.
     model_name : str
         Gemini model to use (default: gemini-2.0-flash).
     """
